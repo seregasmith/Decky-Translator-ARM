@@ -19,6 +19,7 @@ export interface Settings {
     rapidocrBoxThresh: number; // RapidOCR box detection threshold (0.0-1.0)
     rapidocrUnclipRatio: number; // RapidOCR box expansion ratio (1.0-3.0)
     rapidocrPersistentMode: boolean; // Keep RapidOCR worker alive between requests
+    chromeScreenAiAvailable: boolean;
     chromeScreenAiPersistentMode: boolean; // Keep Chrome Screen AI worker alive between requests
     ct2PersistentMode: boolean; // Keep CT2/NLLB worker alive between requests
     pauseGameOnOverlay: boolean; // Setting to control pausing game when overlay is shown
@@ -60,6 +61,7 @@ const initialSettings: Settings = {
     rapidocrBoxThresh: 0.5, // Default RapidOCR box detection threshold (0.0-1.0)
     rapidocrUnclipRatio: 1.6, // Default RapidOCR box expansion ratio (1.0-3.0)
     rapidocrPersistentMode: false,
+    chromeScreenAiAvailable: false,
     chromeScreenAiPersistentMode: false,
     ct2PersistentMode: false,
     pauseGameOnOverlay: false, // Default to not pausing game
@@ -98,7 +100,7 @@ function settingsReducer(state: Settings, action: SettingsAction): Settings {
 // Create the context
 interface SettingsContextType {
     settings: Settings;
-    updateSetting: (key: keyof Settings, value: any, label?: string) => Promise<boolean>;
+    updateSetting: (key: Exclude<keyof Settings, 'chromeScreenAiAvailable'>, value: any, label?: string) => Promise<boolean>;
     initialized: boolean;
 }
 
@@ -136,6 +138,7 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({
                     rapidocrBoxThresh: serverSettings.rapidocr_box_thresh ?? 0.5, // RapidOCR box threshold (0.0-1.0)
                     rapidocrUnclipRatio: serverSettings.rapidocr_unclip_ratio ?? 1.6, // RapidOCR unclip ratio (1.0-3.0)
                     rapidocrPersistentMode: serverSettings.rapidocr_persistent_mode ?? false,
+                    chromeScreenAiAvailable: serverSettings.chromescreenai_available ?? false,
                     chromeScreenAiPersistentMode: serverSettings.chromescreenai_persistent_mode ?? false,
                     ct2PersistentMode: serverSettings.ct2_persistent_mode ?? false,
                     pauseGameOnOverlay: serverSettings.pause_game_on_overlay || false, // Add default if not present
@@ -199,13 +202,13 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({
     };
 
     // Update a single setting
-    const updateSetting = async (key: keyof Settings, value: any, label?: string): Promise<boolean> => {
+    const updateSetting = async (key: Exclude<keyof Settings, 'chromeScreenAiAvailable'>, value: any, label?: string): Promise<boolean> => {
         try {
             // Update local state
             dispatch({ type: 'UPDATE_SETTING', key, value });
 
             // Map frontend setting key to backend setting key
-            const backendKeyMap: Record<keyof Settings, string> = {
+            const backendKeyMap: Record<Exclude<keyof Settings, 'chromeScreenAiAvailable'>, string> = {
                 inputLanguage: 'input_language',
                 targetLanguage: 'target_language',
                 inputMode: 'input_mode',
