@@ -1,0 +1,69 @@
+name: Build ARM64 plugin
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [arm64]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    env:
+      BUILD_DIR: ${{ runner.temp }}/decky-translator-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build frontend
+        run: |
+          npm install -g pnpm@9
+          pnpm install --frozen-lockfile
+          pnpm run build
+
+      - uses: actions/setup-python@v5
+        id: worker_python
+        with:
+          python-version: '3.13'
+
+      - uses: actions/setup-python@v5
+        id: loader_python
+        with:
+          python-version: '3.14'
+
+      - name: Install ARM64 dependencies
+        env:
+          WORKER_PYTHON: ${{ steps.worker_python.outputs.python-path }}
+          LOADER_PYTHON: ${{ steps.loader_python.outputs.python-path }}
+        run: |
+          mkdir -p "$BUILD_DIR/python313"
+          "$WORKER_PYTHON" -m pip install --only-binary=:all: --no-compile \
+            -r requirements.txt --target "$BUILD_DIR/py_modules"
+          "$LOADER_PYTHON" -m pip install --only-binary=:all: --no-compile \
+            'Pillow>=12,<13' --target "$BUILD_DIR/loader_py_modules/cp314"
+          rm -rf "$BUILD_DIR/py_modules/rapidocr/models"
+          mkdir "$BUILD_DIR/py_modules/rapidocr/models"
+          curl --fail --location --retry 3 --output "$BUILD_DIR/python.tar.gz" \
+            'https://github.com/astral-sh/python-build-standalone/releases/download/20260408/cpython-3.13.13%2B20260408-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz'
+          echo "f06466ac56cdc185d61190ea89f9c4e84ff4fc03ac08793151970a1fea86410b  $BUILD_DIR/python.tar.gz" | sha256sum --check
+          tar -xzf "$BUILD_DIR/python.tar.gz" -C "$BUILD_DIR/python313"
+
+      - name: Verify imports and package
+        env:
+          LOADER_PYTHON: ${{ steps.loader_python.outputs.python-path }}
+        run: |
+          PYTHONPATH="$BUILD_DIR/py_modules" "$BUILD_DIR/python313/python/bin/python3.13" -S \
+            -c 'import cv2, ctranslate2, numpy, onnxruntime, rapidocr, sentencepiece; from PIL import Image'
+          PYTHONPATH="$BUILD_DIR/loader_py_modules/cp314:$BUILD_DIR/py_modules" "$LOADER_PYTHON" -S \
+            -c 'from PIL import Image; Image.new("RGB", (4, 4)).tobytes()'
+          "$LOADER_PYTHON" scripts/package_arm64.py "$BUILD_DIR" out/Decky-Translator-arm64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Decky-Translator-arm64
+          path: out/Decky-Translator-arm64.zip
+          if-no-files-found: error

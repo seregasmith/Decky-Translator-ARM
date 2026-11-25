@@ -753,7 +753,7 @@ export const TabTranslation: VFC<TabTranslationProps> = ({ scrollTarget, onScrol
                                     { label: <span>OCR.space</span>, data: "ocrspace" },
                                     { label: <span style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px", width: "100%", height: "20px", lineHeight: "20px" }}><span>Google Cloud</span><span className="dt-recommended-tag" style={{ fontSize: "10px", color: "#9aa0a6", fontStyle: "italic" }}>★ recommended</span></span>, data: "googlecloud" },
                                     { label: <span style={{ display: "flex", alignItems: "center", gap: "6px", height: "20px", lineHeight: "20px" }}>Gemini Vision <BsStars style={{ fontSize: "12px" }} /></span>, data: "gemini_vision" }
-                                ]}
+                                ].filter(option => option.data !== 'chromescreenai' || settings.chromeScreenAiAvailable)}
                                 selectedOption={settings.ocrProvider}
                                 onChange={(option) => {
                                     updateSetting('ocrProvider', option.data, 'OCR provider');

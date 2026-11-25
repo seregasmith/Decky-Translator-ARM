@@ -2,6 +2,7 @@
 import asyncio
 from asyncio.subprocess import PIPE
 import os
+import platform
 import sys
 import traceback
 import subprocess
@@ -14,6 +15,7 @@ import re
 import json
 import base64
 import tarfile
+import tempfile
 import shutil
 import glob
 from urllib.parse import urlparse, unquote
@@ -29,8 +31,8 @@ BIN_DIR = os.path.join(PLUGIN_DIR, "bin")
 DEPENDENCIES_ARCHIVE = os.path.join(BIN_DIR, "plugin-dependencies.tar.gz")
 EXTRACTION_MARKER = os.path.join(BIN_DIR, ".dependencies-extracted")
 BIN_PY_MODULES_DIR = os.path.join(BIN_DIR, "py_modules")
-BIN_RAPIDOCR_DIR = os.path.join(BIN_DIR, "rapidocr")
-BIN_PYTHON_DIR = os.path.join(BIN_DIR, "python313")
+BIN_RAPIDOCR_DIR = os.path.join(BIN_PY_MODULES_DIR, "rapidocr")
+BIN_PYTHON_DIR = os.path.join(BIN_DIR, "python313", "python", "bin", "python3.13")
 
 def _should_extract_dependencies():
     """Check if dependencies archive needs to be extracted."""
@@ -84,6 +86,11 @@ if ROOT_PY_MODULES_DIR not in sys.path:
 if os.path.exists(BIN_PY_MODULES_DIR) and BIN_PY_MODULES_DIR not in sys.path:
     sys.path.insert(0, BIN_PY_MODULES_DIR)
 
+# Decky and the bundled worker may use different CPython versions.
+loader_modules = os.path.join(BIN_DIR, "loader_py_modules", f"cp{sys.version_info.major}{sys.version_info.minor}")
+if os.path.isdir(loader_modules) and loader_modules not in sys.path:
+    sys.path.insert(0, loader_modules)
+
 # Now import third-party libraries (after sys.path is configured)
 import decky_plugin
 import urllib3
@@ -94,6 +101,8 @@ from providers import ProviderManager, TextRegion, NetworkError, ApiKeyError, Ra
 from providers.translation_cache import TranslationCache, PROVIDER_TIERS, normalize
 
 _processing_lock = False
+CHROME_SCREEN_AI_AVAILABLE = platform.machine() == "x86_64"
+DEFAULT_OCR_PROVIDER = "chromescreenai" if CHROME_SCREEN_AI_AVAILABLE else "rapidocr"
 
 SENSITIVE_SETTING_KEYS = {
     "google_api_key",
@@ -1180,7 +1189,7 @@ class Plugin:
     # Provider system
     _provider_manager: ProviderManager = None
     _use_free_providers: bool = True  # Default to free providers (no API key needed)
-    _ocr_provider: str = "chromescreenai"  # "rapidocr" (RapidOCR), "ocrspace" (OCR.space), or "googlecloud" (Google Cloud)
+    _ocr_provider: str = DEFAULT_OCR_PROVIDER
     _translation_provider: str = "freegoogle"  # "freegoogle" or "googlecloud"
 
     # Translation cache
@@ -1294,6 +1303,8 @@ class Plugin:
         return self._settings.get_setting(key, default)
 
     async def set_setting(self, key, value):
+        if key == "ocr_provider" and value == "chromescreenai" and not CHROME_SCREEN_AI_AVAILABLE:
+            return False
         logger.debug(f"Setting {key} to: {_mask_for_log(key, value)}")
         if key in SENSITIVE_SETTING_KEYS and isinstance(value, str):
             cleaned = _clean_api_key(value)
@@ -1506,6 +1517,7 @@ class Plugin:
                 "enabled": self._settings.get_setting("enabled", True),
                 "use_free_providers": self._use_free_providers,
                 "ocr_provider": self._ocr_provider,
+                "chromescreenai_available": CHROME_SCREEN_AI_AVAILABLE,
                 "translation_provider": self._translation_provider,
                 "google_api_key": self._google_vision_api_key,  # Single key for frontend
                 "google_vision_api_key": self._google_vision_api_key,
@@ -1608,7 +1620,7 @@ class Plugin:
             xdg_runtime = f"/run/user/{uid}"
 
             result = {"path": "", "base64": ""}
-            for _ in range(2):
+            for attempt in range(2):
                 if self._capture_backend is None or self._session_env is None:
                     self._session_env = self._load_session_env()
                     logger.info(f"Session env borrowed: XDG_CURRENT_DESKTOP={self._session_env.get('XDG_CURRENT_DESKTOP', '<unset>')}")
@@ -1621,8 +1633,15 @@ class Plugin:
                 env.setdefault("WAYLAND_DISPLAY", "wayland-0")
                 env.setdefault("HOME", DECKY_HOME)
 
+                if attempt == 0:
+                    gamescope_result = await self._take_screenshot_gamescope(env, screenshot_path)
+                    if gamescope_result:
+                        return gamescope_result
+
                 if self._capture_backend is None:
-                    self._capture_backend = await self._select_capture_backend(env)
+                    self._capture_backend = await self._select_capture_backend(
+                        self._clean_system_binary_env(env)
+                    )
 
                 if self._capture_backend == "pipewire":
                     result = await self._take_screenshot_pipewire(
@@ -1650,20 +1669,81 @@ class Plugin:
         finally:
             _processing_lock = False
 
+    async def _take_screenshot_gamescope(self, env, screenshot_path):
+        gamescopectl = "/usr/bin/gamescopectl"
+        if not os.access(gamescopectl, os.X_OK):
+            return None
+
+        runtime = Path(env["XDG_RUNTIME_DIR"])
+        display = env.get("GAMESCOPE_WAYLAND_DISPLAY")
+        if not display:
+            try:
+                for line in (runtime / "gamescope-environment").read_text().splitlines():
+                    key, _, value = line.partition("=")
+                    if key == "GAMESCOPE_WAYLAND_DISPLAY":
+                        display = value
+                        break
+            except OSError:
+                return None
+
+        if not display or not (runtime / display).is_socket():
+            return None
+
+        env = self._clean_system_binary_env(env)
+        env["GAMESCOPE_WAYLAND_DISPLAY"] = display
+        logger.info("Trying native Gamescope screenshot")
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="decky-translator-") as directory:
+                frame = Path(directory) / "frame.png"
+                proc = await asyncio.create_subprocess_exec(
+                    gamescopectl, "screenshot", str(frame),
+                    stdout=PIPE, stderr=PIPE, env=env,
+                )
+                try:
+                    _, err = await asyncio.wait_for(proc.communicate(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    if proc.returncode is None:
+                        proc.kill()
+                    await proc.wait()
+                    logger.warning("gamescopectl screenshot command timed out")
+                    return None
+                if proc.returncode:
+                    logger.warning("gamescopectl screenshot failed: %s", err.decode(errors="replace").strip())
+                    return None
+
+                # gamescopectl can exit before Gamescope finishes writing the PNG.
+                for _ in range(60):
+                    try:
+                        data = frame.read_bytes()
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        if data.startswith(b"\x89PNG\r\n\x1a\n") and data.endswith(b"\x00\x00\x00\x00IEND\xae\x42\x60\x82"):
+                            Path(screenshot_path).write_bytes(data)
+                            logger.info("Captured screenshot with Gamescope (%d bytes)", len(data))
+                            return {"path": screenshot_path, "base64": base64.b64encode(data).decode("ascii")}
+                    await asyncio.sleep(0.05)
+        except OSError as error:
+            logger.warning("Gamescope screenshot failed: %s", error)
+            return None
+
+        logger.warning("Gamescope did not write a complete screenshot")
+        return None
+
     async def _take_screenshot_pipewire(self, env, screenshot_path, MIN_VALID_SIZE, MAX_ATTEMPTS, FALLBACK_NUM_BUFFERS, FALLBACK_STDDEV_THRESHOLD):
-        env = dict(env)
-        env.update({
-            "XDG_SESSION_TYPE": "wayland",
-            "GST_PLUGIN_PATH": str(GSTPLUGINSPATH),
-            "LD_LIBRARY_PATH": str(DEPSPATH),
-        })
+        env = self._clean_system_binary_env(env)
+        env["XDG_SESSION_TYPE"] = "wayland"
+        if GSTPLUGINSPATH.is_dir():
+            env["GST_PLUGIN_PATH"] = str(GSTPLUGINSPATH)
+            env["LD_LIBRARY_PATH"] = str(DEPSPATH)
 
         # Pngenc probing
         if self._has_pngenc is None:
             try:
                 probe = await asyncio.create_subprocess_exec(
                     '/usr/bin/gst-inspect-1.0', '--exists', 'pngenc',
-                    stdout=PIPE, stderr=PIPE
+                    stdout=PIPE, stderr=PIPE, env=env
                 )
                 await asyncio.wait_for(probe.communicate(), timeout=2.0)
                 self._has_pngenc = (probe.returncode == 0)
@@ -1766,7 +1846,9 @@ class Plugin:
                     out, err = await proc.communicate()
 
             stderr_output = err.decode().strip()
-            if stderr_output:
+            if stderr_output and proc.returncode:
+                logger.warning(f"Attempt {attempt}: GStreamer failed: {stderr_output}")
+            elif stderr_output:
                 logger.debug(f"Attempt {attempt}: GStreamer stderr: {stderr_output}")
             logger.debug(f"Attempt {attempt}: GStreamer return code: {proc.returncode} (timed_out={timed_out})")
 
@@ -2587,7 +2669,7 @@ class Plugin:
 
     async def download_chromescreenai(self):
         try:
-            if not self._provider_manager:
+            if not CHROME_SCREEN_AI_AVAILABLE or not self._provider_manager:
                 return False
             return self._provider_manager.download_chromescreenai()
         except Exception as e:
@@ -2726,6 +2808,9 @@ class Plugin:
             self._gemini_model = self._settings.get_setting("gemini_model", "gemini-2.5-flash")
 
             saved_ocr_provider = self._settings.get_setting("ocr_provider")
+            if not CHROME_SCREEN_AI_AVAILABLE and saved_ocr_provider == "chromescreenai":
+                saved_ocr_provider = DEFAULT_OCR_PROVIDER
+                self._settings.set_setting("ocr_provider", saved_ocr_provider)
             if saved_ocr_provider is not None:
                 self._ocr_provider = saved_ocr_provider
                 self._use_free_providers = (saved_ocr_provider != "googlecloud")
@@ -2734,7 +2819,7 @@ class Plugin:
 
             # One-shot migration of the old rapidocr default to chromescreenai
             if not self._settings.get_setting("default_ocr_provider_migrated_v1", False):
-                if saved_ocr_provider == "rapidocr":
+                if CHROME_SCREEN_AI_AVAILABLE and saved_ocr_provider == "rapidocr":
                     self._ocr_provider = "chromescreenai"
                     self._use_free_providers = True
                     self._settings.set_setting("ocr_provider", "chromescreenai")
