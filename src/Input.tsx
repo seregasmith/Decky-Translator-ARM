@@ -247,11 +247,13 @@ export class Input {
             buttons.push(Button.R3);
         }
 
-        // Check for touchpad buttons (for TOUCHPAD_COMBO mode)
-        if (this.currentlyPressedButtons.has(Button.LEFT_TOUCHPAD_TOUCH)) {
+        // A touchpad can report touch, click, or both.
+        if (this.currentlyPressedButtons.has(Button.LEFT_TOUCHPAD_TOUCH) ||
+            this.currentlyPressedButtons.has(Button.LEFT_TOUCHPAD_CLICK)) {
             buttons.push(Button.LEFT_TOUCHPAD_TOUCH);
         }
-        if (this.currentlyPressedButtons.has(Button.RIGHT_TOUCHPAD_TOUCH)) {
+        if (this.currentlyPressedButtons.has(Button.RIGHT_TOUCHPAD_TOUCH) ||
+            this.currentlyPressedButtons.has(Button.RIGHT_TOUCHPAD_CLICK)) {
             buttons.push(Button.RIGHT_TOUCHPAD_TOUCH);
         }
 

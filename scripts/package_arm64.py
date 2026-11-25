@@ -41,6 +41,7 @@ def main():
         "py_modules/onnxruntime",
         "py_modules/rapidocr",
         "loader_py_modules/cp314/PIL",
+        "loader_py_modules/cp314/evdev",
     ):
         if not (args.dependencies / required).exists():
             raise FileNotFoundError(args.dependencies / required)

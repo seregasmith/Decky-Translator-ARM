@@ -42,10 +42,16 @@ RUN "$WORKER_PYTHON" -m pip install --only-binary=:all: --no-compile --no-cache-
     && rm -rf "$DEPS_DIR/py_modules/rapidocr/models" \
     && mkdir "$DEPS_DIR/py_modules/rapidocr/models"
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc libc6-dev linux-libc-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m pip install --no-deps --no-compile --no-cache-dir \
+        'evdev==2.0.0' --target "$DEPS_DIR/loader_py_modules/cp314"
+
 RUN PYTHONPATH="$DEPS_DIR/py_modules" "$WORKER_PYTHON" -S \
         -c 'import cv2, ctranslate2, numpy, onnxruntime, rapidocr, sentencepiece; from PIL import Image' \
     && PYTHONPATH="$DEPS_DIR/loader_py_modules/cp314:$DEPS_DIR/py_modules" python -S \
-        -c 'from PIL import Image; Image.new("RGB", (4, 4)).tobytes()'
+        -c 'import evdev; from PIL import Image; evdev.list_devices(); Image.new("RGB", (4, 4)).tobytes()'
 
 COPY LICENSE README.md THIRD_PARTY_LICENSES main.py package.json plugin.json ./
 COPY py_modules/providers/ py_modules/providers/

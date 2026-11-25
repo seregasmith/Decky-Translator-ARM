@@ -269,6 +269,8 @@ class HidrawButtonMonitor:
         'START': 0x00004000,
         'L5': 0x00008000,
         'R5': 0x00010000,
+        'LEFT_PAD_CLICK': 0x00020000,
+        'RIGHT_PAD_CLICK': 0x00040000,
         'LEFT_PAD_TOUCH': 0x00080000,
         'RIGHT_PAD_TOUCH': 0x00100000,
         'L3': 0x00400000,
@@ -303,48 +305,51 @@ class HidrawButtonMonitor:
         Supports:
         - Steam Deck controller (VID:28DE, PID:1205) with 3 hidraw interfaces
         - InputPlumber virtual controller (VID:28DE, PID:12FB) on non-Steam Deck handhelds
+        - Other Valve-compatible devices that emit Steam Deck input reports
 
         For Steam Deck, we need interface :1.2 for gamepad data.
         For InputPlumber, there's typically a single virtual hidraw device.
         """
         steamdeck_candidates = []
-        other_valve_candidates = []
+        inputplumber_candidates = []
+        legacy_candidates = []
 
-        for i in range(10):
-            path = f'/dev/hidraw{i}'
-            if os.path.exists(path):
-                uevent_path = f'/sys/class/hidraw/hidraw{i}/device/uevent'
-                try:
-                    with open(uevent_path, 'r') as f:
-                        content = f.read().upper()
-                        if '28DE' not in content:
-                            continue
-                        if '1205' in content:
-                            steamdeck_candidates.append((i, path))
-                            logger.debug(f"Found Steam Deck controller candidate at {path}")
-                        elif '12FB' in content:
-                            other_valve_candidates.append((i, path))
-                            logger.debug(f"Found InputPlumber virtual controller candidate at {path}")
-                        else:
-                            # Valve devices use non-standard HID protocols - let evdev handle them
-                            logger.debug(f"Skipping unsupported Valve hidraw at {path}")
-                except Exception as e:
-                    logger.debug(f"Cannot read uevent for hidraw{i}: {e}")
+        for device in sorted(Path('/sys/class/hidraw').glob('hidraw*')):
+            path = f'/dev/{device.name}'
+            if not os.path.exists(path):
+                continue
+            try:
+                content = (device / 'device' / 'uevent').read_text()
+            except OSError as e:
+                logger.debug(f"Cannot read uevent for {device.name}: {e}")
+                continue
+            match = re.search(r'^HID_ID=[0-9A-F]+:([0-9A-F]+):([0-9A-F]+)$', content, re.MULTILINE | re.IGNORECASE)
+            if match is None or int(match[1], 16) != self.VALVE_VID:
+                continue
+            pid = int(match[2], 16)
+            if pid == self.STEAMDECK_PID:
+                steamdeck_candidates.append((device, path))
+                logger.debug(f"Found Steam Deck controller candidate at {path}")
+            elif pid == self.INPUTPLUMBER_PID:
+                inputplumber_candidates.append(path)
+                logger.debug(f"Found InputPlumber virtual controller candidate at {path}")
+            else:
+                legacy_candidates.append((pid, path))
 
         # Prefer real Steam Deck controller (interface :1.2)
         if steamdeck_candidates:
-            for i, path in steamdeck_candidates:
+            for device, path in steamdeck_candidates:
                 try:
-                    link_target = os.readlink(f'/sys/class/hidraw/hidraw{i}')
+                    link_target = os.readlink(device)
                     if ':1.2/' in link_target:
                         logger.info(f"Found Steam Deck gamepad interface at {path} (interface 1.2)")
                         self.device_pid = self.STEAMDECK_PID
                         return path
                 except Exception as e:
-                    logger.debug(f"Cannot read symlink for hidraw{i}: {e}")
+                    logger.debug(f"Cannot read symlink for {device.name}: {e}")
 
             # Fallback: try data availability
-            for i, path in steamdeck_candidates:
+            for _, path in steamdeck_candidates:
                 try:
                     fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
                     try:
@@ -367,9 +372,9 @@ class HidrawButtonMonitor:
             self.device_pid = self.STEAMDECK_PID
             return path
 
-        # Try InputPlumber / other Valve virtual devices
-        if other_valve_candidates:
-            for i, path in other_valve_candidates:
+        # Try the known InputPlumber virtual devices first.
+        if inputplumber_candidates:
+            for path in inputplumber_candidates:
                 try:
                     fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
                     try:
@@ -387,13 +392,30 @@ class HidrawButtonMonitor:
                     logger.debug(f"Cannot open {path}: {e}")
 
             # Last resort
-            path = other_valve_candidates[-1][1]
+            path = inputplumber_candidates[-1]
             logger.info(f"Using Valve-compatible controller at {path} (last candidate)")
             self.device_pid = self.INPUTPLUMBER_PID
             return path
 
+        for pid, path in legacy_candidates:
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                try:
+                    readable, _, _ = select.select([fd], [], [], 0.1)
+                    if readable and self._is_deck_report(os.read(fd, self.PACKET_SIZE)):
+                        self.device_pid = pid
+                        logger.info(f"Found Steam Deck-compatible input reports at {path}")
+                        return path
+                finally:
+                    os.close(fd)
+            except OSError as e:
+                logger.debug(f"Cannot probe {path}: {e}")
+
         logger.info("No supported Valve hidraw device found; relying on evdev only")
         return None
+
+    def _is_deck_report(self, data):
+        return len(data) == self.PACKET_SIZE and data.startswith(b'\x01\x00\x09')
 
     def send_feature_report(self, data):
         """Send a HID feature report to the device."""
@@ -416,8 +438,8 @@ class HidrawButtonMonitor:
                 return False
 
         try:
-            # Open device with read/write access
-            self.device_fd = os.open(self.device_path, os.O_RDWR)
+            mode = os.O_RDWR if self.device_pid == self.STEAMDECK_PID else os.O_RDONLY
+            self.device_fd = os.open(self.device_path, mode)
             logger.info(f"Opened {self.device_path} for hidraw monitoring (pid={hex(self.device_pid or 0)})")
 
             # Only send init commands for real Steam Deck hardware
@@ -543,6 +565,9 @@ class HidrawButtonMonitor:
 
     def _process_packet(self, data):
         """Parse HID packet and generate button events."""
+        if self.device_pid not in (self.STEAMDECK_PID, self.INPUTPLUMBER_PID) and not self._is_deck_report(data):
+            return
+
         # Parse button states from packet
         buttons_l = struct.unpack('<I', data[8:12])[0]
         buttons_h = struct.unpack('<I', data[12:16])[0]
@@ -834,12 +859,6 @@ class TritonHidrawMonitor:
                 "last_buttons": hex(self.last_buttons),
             }
 
-for _p in [ROOT_PY_MODULES_DIR, BIN_PY_MODULES_DIR]:
-    if os.path.exists(_p):
-        if _p in sys.path:
-            sys.path.remove(_p)
-        sys.path.insert(0, _p)
-
 try:
     import evdev
     EVDEV_AVAILABLE = True
@@ -852,10 +871,7 @@ except Exception as e:
 
 
 class EvdevGamepadMonitor:
-    """
-    Monitors external gamepads (Xbox, PlayStation, etc.) via Linux evdev.
-    Filters out Valve's built-in controller (handled by HidrawButtonMonitor).
-    """
+    """Monitors physical and virtual gamepads via Linux evdev."""
 
     SCAN_INTERVAL = 5.0      # seconds between device scans
     CACHE_CLEAR_INTERVAL = 60  # seconds before re-checking rejected devices
@@ -902,7 +918,7 @@ class EvdevGamepadMonitor:
             return False
 
     def _scan_devices(self):
-        """Find new external gamepads, skip Valve and virtual devices."""
+        """Find new gamepad event devices."""
         if not EVDEV_AVAILABLE:
             return
 
@@ -2522,7 +2538,7 @@ class Plugin:
             if not self._triton_monitor.running:
                 self._triton_monitor.start()
 
-            if hidraw_ok:
+            if hidraw_ok or (self._evdev_monitor and self._evdev_monitor.running) or self._triton_monitor.running:
                 return {"success": True, "message": "Monitor started"}
             else:
                 return {"success": False, "error": "Failed to initialize device"}

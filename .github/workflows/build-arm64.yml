@@ -45,6 +45,10 @@ jobs:
             -r requirements.txt --target "$BUILD_DIR/py_modules"
           "$LOADER_PYTHON" -m pip install --only-binary=:all: --no-compile \
             'Pillow>=12,<13' --target "$BUILD_DIR/loader_py_modules/cp314"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc libc6-dev linux-libc-dev
+          "$LOADER_PYTHON" -m pip install --no-deps --no-compile \
+            'evdev==2.0.0' --target "$BUILD_DIR/loader_py_modules/cp314"
           rm -rf "$BUILD_DIR/py_modules/rapidocr/models"
           mkdir "$BUILD_DIR/py_modules/rapidocr/models"
           curl --fail --location --retry 3 --output "$BUILD_DIR/python.tar.gz" \
@@ -59,7 +63,7 @@ jobs:
           PYTHONPATH="$BUILD_DIR/py_modules" "$BUILD_DIR/python313/python/bin/python3.13" -S \
             -c 'import cv2, ctranslate2, numpy, onnxruntime, rapidocr, sentencepiece; from PIL import Image'
           PYTHONPATH="$BUILD_DIR/loader_py_modules/cp314:$BUILD_DIR/py_modules" "$LOADER_PYTHON" -S \
-            -c 'from PIL import Image; Image.new("RGB", (4, 4)).tobytes()'
+            -c 'import evdev; from PIL import Image; evdev.list_devices(); Image.new("RGB", (4, 4)).tobytes()'
           "$LOADER_PYTHON" scripts/package_arm64.py "$BUILD_DIR" out/Decky-Translator-arm64.zip
 
       - uses: actions/upload-artifact@v4
